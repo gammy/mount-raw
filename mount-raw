@@ -1,0 +1,329 @@
+#!/usr/bin/env perl
+=pod 
+mount-raw: List or mount partitions within raw disk dumps.
+By gammy, anno 2023. To reach me, try github.com/gammy
+
+Dependencies:
+    Required: perl, GNU fdisk, mount
+    Optional: sudo, doas
+
+This program should be able to list partition information as long as GNU fdisk
+(emphasis on GNU) is available, but mounting will probably only work on Linux.
+
+This is because this program uses the 'loop' mount-option which, as far as I
+know, is only available in util-linux's version of mount. This of course means
+that this program also needs the system to be built with loopback support.
+
+It's all pretty simple really: 
+Read disk format and partition information via fdisk, calculate the start-byte
+of the partition and then mount it by passing that offset to the mount-command.
+Essentially,
+    mount -o loop,offset=$blocksize*$partition_start_sector $file $mountpoint
+
+Copyright (C) 2023 Kristian Gunstone
+Use of this source code is governed by the Simplified BSD License:
+https://opensource.org/license/bsd-2-clause
+=cut
+
+use strict;
+use warnings;
+use feature 'say';
+use Cwd 'abs_path';
+use File::Basename 'basename';
+
+my $VERSION = '0.9';
+
+## Subroutines ###############################################################
+
+sub show_usage {
+    my $name = basename $0;
+    say << "END";
+$name v$VERSION by gammy, github.com/gammy/mount-raw
+List or mount partitions within raw disk dumps.
+
+Usage: $name <file> [<partition> <mountpoint>]
+
+If only <file> is supplied, $name will list available partitions and exit.
+If [partition] and [mountpoint] are also supplied, the partition is mounted.
+
+Examples:
+  $name foo.img              # List partitions in foo.img
+  $name foo.img 2 /mnt/tmp/  # Mount partition 2 in /mnt/tmp/
+
+$name will try to use 'sudo' / 'doas' when mounting under a non-root user.
+Mounting will ALMOST DEFINITELY only work on Linux as it depends on loopback 
+support both in the mount (util-linux) command, and the 'loop' kernel module.
+
+Use of this source code is governed by the Simplified BSD License:
+https://opensource.org/license/bsd-2-clause
+END
+}
+
+# Check if a executable exists within a list of paths, akin to which (1).
+# 
+# params: executable to search for, arrayref to search-paths
+# return: path to first match, or undef
+sub cheap_which {
+    my ($dep, $path_aref) = @_;
+    my @paths = @$path_aref;
+    for my $path (@paths) {
+        my $full_path = "$path/$dep";
+        return $full_path if -x $full_path;
+    }
+    return undef;
+}
+
+# Check which executables are available from a given list.
+# 
+# params: array of executables to search for, arrayref to search-paths
+# return: array of paths to found executables, undef if none were found
+sub which_any {
+    my $paths_aref = pop;
+    my @found_deps;
+    for my $dep (@_) {
+        my $found = cheap_which $dep, $paths_aref;
+        push @found_deps, $found if defined $found;
+    }
+    return @found_deps;
+}
+
+# Check which executables are missing from a given list.
+#
+# params: array of executables, arrayref to search-paths
+# return: array of missing executables, undef if all were found
+sub which_all {
+    my $paths_aref = pop;
+    my @missing_deps;
+    for my $dep (@_) {
+        next if cheap_which($dep, $paths_aref);
+        push @missing_deps, $dep;
+    }
+    return @missing_deps;
+}
+
+# Create a partition information hash. 
+# The fdisk utility is invoked to enumerate any partitions available in a file.
+# Relevant information is populated in a hash, which is returned upon success.
+# Note that a file containing 0 partitions is *not* considered to be a failure.
+#
+# param: path to the file containing partitions to be enumerated
+# return: hashref on success, undef on error
+sub enum_image {
+    my $filename = shift;
+    my $info = { 
+        'filename'   => $filename,
+        'basename'   => basename($filename),
+        'blocksize'  => 'unknown',
+        'schema'     => 'unknown',
+        'ident'      => 'unknown'
+    };
+
+    my $fdisk_opts = '-o Start,End,Sectors,Size,Type -l';
+    my $output = `fdisk $fdisk_opts "$info->{filename}"` || return;
+    my @output_lines = split /\n/, $output;
+
+    my (@partitions, @numbers, $reading_table);
+    my $number = 1;
+
+    for my $line (@output_lines) {
+        $line =~ s/^\s+//;
+        unless($reading_table) {
+            if($line =~ m/^Sector.*: (\d+) bytes/) {
+                $info->{blocksize} = $1;
+            } elsif($line =~ m/^Disklabel type: (.*)$/) {
+                $info->{schema} = $1;
+            } elsif($line =~ m/^Disk identifier: (.*)$/) {
+                $info->{ident} = $1;
+            } elsif($line =~ m/^Start.*Type$/) {
+                $reading_table = 1;
+            }
+        } else {
+            my @cols = split /[\s|\t]+/, $line;
+            my ($beg, $end, $sectors, $size, @type_name) = @cols;
+            my $part = {
+                'beg'       => $beg,
+                'end'       => $end,
+                'sectors'   => $sectors,
+                'size'      => $size,
+                'type_name' => "@type_name",
+                'number'    => $number,
+                'alias'     => "'$info->{basename}' @type_name partition $number"
+            };
+            push @numbers, $part->{number};
+            push @partitions, $part;
+            $number++;
+        }
+    }
+
+    $info->{partitions} = \@partitions;
+    $info->{numbers} = \@numbers;
+    return $info;
+}
+
+# Get the part-hashref associated with a partition number
+#
+# params: info-hashref from enum_image, partition number
+# return: part-hashref with partition information, or undef
+sub get_part {
+    my ($info, $number) = @_;
+    return unless $number =~ m/^\d+$/;
+    for my $entry (@{$info->{partitions}}) {
+        return $entry if $entry->{number} eq $number;
+    }
+}
+
+# Display partition information in an info hash (as returned by `enum_*`)
+#
+# param: info-hashref from enum_image
+sub list_parts {
+    my $info = shift;
+    my @parts = @{$info->{partitions}};
+
+    say "Source: '$info->{filename}'\n" .
+        "Schema: $info->{schema}\n" .
+        "Ident : $info->{ident}\n" .
+        "Units : $info->{blocksize} bytes per block\n";
+
+    printf "%d partition%s%s\n\n", scalar @parts, 
+           @parts == 1 ? '' : 's',
+           @parts == 0 ? '' : ':';
+
+    for my $part (@parts) {
+        printf "Partition %d, block %s - %s:\n" .
+               "  Type: %s\n" .
+               "  Size: %s (%s blocks)\n\n",
+               $part->{number}, 
+               $part->{beg}, 
+               $part->{end},
+               $part->{type_name},
+               $part->{size}, 
+               $part->{sectors};
+    }
+}
+
+# Mount a given partition within a file.
+#
+# params: info-hashref from enum_image, part-hashref, mountpoint
+# returns: exit code of 'mount' (usually zero on success)
+sub mount_part {
+    my ($info, $part, $mount) = @_;
+
+    # See if we've already been mounted on $mount.
+    # `mount` output prints mounts as absolute paths with no trailing slashes, 
+    # so make our provided mount conform to that standard to ease comparison.
+    my $abs_mount    = abs_path($mount);
+    my $abs_filename = abs_path($info->{filename});
+
+    # This check isn't strictly necessary; mount (at least GNU) will return
+    # an error and print a message if it's already mounted, but checking for
+    # ourselves grants us more detailed information.
+    my $raw_output = `mount` || return $? >> 8;
+    my @output = split /\n/, $raw_output;
+    my $already_mounted;
+
+    for my $line (@output) {
+        my @cols = split /[\s|\t]+/, $line;
+        my ($src, $dst) = ($cols[0], $cols[2]); # Expects '[src] on [dst] ...'
+        next unless $src eq $abs_filename;
+
+        if($dst eq $abs_mount) {
+            $already_mounted = 1;
+            say "'$abs_filename' is already mounted on '$abs_mount'.";
+        } else {
+            say "Note: '$abs_filename' is also mounted on '$dst', " .
+                "perhaps for a different partition?";
+        }
+    }
+
+    return 32 if $already_mounted; # GNU mount(8): 32 = mount failure
+
+    # Construct and run the mount command
+    my $mount_run = $info->{use_sudo} ? "$info->{sudo_bin} mount" : "mount";
+    my $mount_cmd = sprintf("%s -o loop,offset=%d '%s' '%s'",
+                            $mount_run, $part->{beg} * $info->{blocksize},
+                            $abs_filename, $abs_mount);
+
+    my $ret = system($mount_cmd);
+
+    $ret >>= 8;
+    if($ret == 0) {
+        say "Mounted $part->{alias} on '$mount'";
+    } else {
+        say STDERR "Error: mount: non-zero exit-code $ret. The command was:";
+        say STDERR "> $mount_cmd";
+    }
+
+    return $ret;
+}
+
+#############################################################################
+
+# Disable localization & color; they may clobber fdisk's output formatting.
+$ENV{LC_ALL} = 'C';
+$ENV{NO_COLOR} = '1';
+
+# Cache search-paths which will be used throughout.
+my @search_paths = split ':', $ENV{PATH};
+# Add some common sbin-paths which may not be in a non-root user's PATH
+push @search_paths, ('/sbin', '/usr/sbin', '/usr/local/sbin');
+my $paths_aref = [@search_paths];
+
+# Assert dependencies
+my @missing_required = which_all qw/fdisk mount/, $paths_aref;
+if(@missing_required > 0) {
+    my $list = join ', ', @missing_required;
+    say STDERR "Error: $list: required ependencies not found.";
+    exit 1;
+}
+
+# Rudimentary option check
+# list-mode : 1 option  (filename)
+# mount-mode: 3 options (filename, partition, mountpoint)
+if((@ARGV != 1 && @ARGV != 3) || grep(/^(-h|--help)$/, @ARGV)) {
+    show_usage;
+    exit 0;
+}
+
+my $list_only = @ARGV == 1;
+my ($filename, $part_selected, $mount) = @ARGV;
+
+unless(-e $filename) {
+    say STDERR "Error: '$filename': no such file.";
+    exit 1;
+}
+
+my $info = enum_image $filename;
+
+if(! defined $info) {
+    say STDERR "Error: '$filename': unable to read partition layout.";
+    exit 1;
+}
+
+if($list_only) {
+    list_parts $info;
+    exit 0;
+}
+
+my $part = get_part($info, $part_selected);
+unless(defined $part) {
+    say STDERR "Error: $part_selected: invalid partition selection.";
+    say "Partitions available: @{$info->{numbers}}";
+    exit 1;
+}
+
+unless(-e $mount) {
+    say STDERR "Error: '$mount': invalid mountpoint (no such directory)";
+    exit 1;
+}
+
+# Check if we have a sudo command, and if we should use it.
+my $user_id = $<;
+($info->{sudo_bin}) = which_any(qw/sudo doas/, $paths_aref);
+$info->{use_sudo} = $user_id != 0 && defined($info->{sudo_bin});
+
+if($user_id != 0 && ! defined($info->{sudo_bin})) {
+    say STDERR "Warn: sudo not found and user (UID $user_id) is not root: " .
+               "the mount-command will probably fail.";
+}
+
+exit mount_part $info, $part, $mount;
