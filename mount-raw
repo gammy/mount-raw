@@ -31,7 +31,7 @@ use feature 'say';
 use Cwd 'abs_path';
 use File::Basename 'basename';
 
-my $VERSION = '0.9';
+my $VERSION = '0.9.1';
 
 ## Subroutines ###############################################################
 
@@ -95,7 +95,7 @@ sub which_all {
     my $paths_aref = pop;
     my @missing_deps;
     for my $dep (@_) {
-        next if cheap_which($dep, $paths_aref);
+        next if cheap_which $dep, $paths_aref;
         push @missing_deps, $dep;
     }
     return @missing_deps;
@@ -118,8 +118,14 @@ sub enum_image {
         'ident'      => 'unknown'
     };
 
-    my $fdisk_opts = '-o Start,End,Sectors,Size,Type -l';
-    my $output = `fdisk $fdisk_opts "$info->{filename}"` || return;
+    my @part_col_names = qw/Start End Sectors Size Type/;
+    my $expected_column_count = scalar @part_col_names;
+
+    my ($first_name, $last_name) = ($part_col_names[0], $part_col_names[-1]);
+    my $fdisk_cmd = sprintf "fdisk -o %s -l '%s'",
+                            join(',', @part_col_names), $filename;
+
+    my $output = `$fdisk_cmd` || return;
     my @output_lines = split /\n/, $output;
 
     my (@partitions, @numbers, $reading_table);
@@ -134,11 +140,13 @@ sub enum_image {
                 $info->{schema} = $1;
             } elsif($line =~ m/^Disk identifier: (.*)$/) {
                 $info->{ident} = $1;
-            } elsif($line =~ m/^Start.*Type$/) {
+            } elsif($line =~ m/^$first_name.*$last_name$/) {
                 $reading_table = 1;
             }
         } else {
             my @cols = split /[\s|\t]+/, $line;
+            next if @cols != $expected_column_count;
+
             my ($beg, $end, $sectors, $size, @type_name) = @cols;
             my $part = {
                 'beg'       => $beg,
@@ -237,6 +245,12 @@ sub mount_part {
 
     return 32 if $already_mounted; # GNU mount(8): 32 = mount failure
 
+    if($info->{blocksize} !~ m/^\d+$/) {
+        say STDERR "Error: blocksize unknown, unable to compute offset. " .
+                   "Unable to mount $part->{alias}.";
+        return 32; # GNU mount(8): 32 = mount failure
+    }
+
     # Construct and run the mount command
     my $mount_run = $info->{use_sudo} ? "$info->{sudo_bin} mount" : "mount";
     my $mount_cmd = sprintf("%s -o loop,offset=%d '%s' '%s'",
@@ -249,7 +263,8 @@ sub mount_part {
     if($ret == 0) {
         say "Mounted $part->{alias} on '$mount'";
     } else {
-        say STDERR "Error: mount: non-zero exit-code $ret. The command was:";
+        say STDERR "Error: mount: non-zero exit-code $ret when attempting " .
+                   "to mount $part->{alias}. The command was:";
         say STDERR "> $mount_cmd";
     }
 
