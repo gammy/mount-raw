@@ -31,7 +31,7 @@ use feature 'say';
 use Cwd 'abs_path';
 use File::Basename 'basename';
 
-my $VERSION = '0.9.1';
+my $VERSION = '0.9.2';
 
 ## Subroutines ###############################################################
 
@@ -145,7 +145,7 @@ sub enum_image {
             }
         } else {
             my @cols = split /[\s|\t]+/, $line;
-            next if @cols != $expected_column_count;
+            next if @cols < $expected_column_count;
 
             my ($beg, $end, $sectors, $size, @type_name) = @cols;
             my $part = {
