@@ -31,7 +31,7 @@ use feature 'say';
 use Cwd 'abs_path';
 use File::Basename 'basename';
 
-my $VERSION = '0.9.2';
+my $VERSION = '0.9.3';
 
 ## Subroutines ###############################################################
 
@@ -253,8 +253,10 @@ sub mount_part {
 
     # Construct and run the mount command
     my $mount_run = $info->{use_sudo} ? "$info->{sudo_bin} mount" : "mount";
-    my $mount_cmd = sprintf("%s -o loop,offset=%d '%s' '%s'",
-                            $mount_run, $part->{beg} * $info->{blocksize},
+    my $mount_cmd = sprintf("%s -o loop,offset=%d,sizelimit=%d '%s' '%s'",
+                            $mount_run,
+                            $part->{beg} * $info->{blocksize},
+                            $part->{sectors} * $info->{blocksize},
                             $abs_filename, $abs_mount);
 
     my $ret = system($mount_cmd);
